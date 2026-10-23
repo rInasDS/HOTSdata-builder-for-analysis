@@ -1,0 +1,19 @@
+{
+  "build": "97771",
+  "workers": 4,
+  "paths": {
+    "db4anal": "db4anal",
+    "replays": "parsers_db/stormreps",
+    "s2ma": "parsers_db/S2MA",
+    "map_assets": "parsers_db/MAP-ASSETS",
+    "heroesdecode": "auto",
+    "gamedata_cache": "parsers_db/_gamedata_cache",
+    "gamedata_extract_root": "auto"
+  },
+  "source": {
+    "repository": "jamiephan/HeroesOfTheStorm_Gamedata"
+  },
+  "hero": {
+    "run_build_matched_version_pipeline": true
+  }
+}
