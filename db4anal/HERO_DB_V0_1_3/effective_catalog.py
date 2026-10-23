@@ -1,0 +1,266 @@
+from __future__ import annotations
+from copy import deepcopy
+from pathlib import Path
+from collections import defaultdict, Counter
+from json_backend import load, save
+
+ARRAY_TAG_HINTS=("Array","Events")
+
+def _key(d): return (d.get("xml_type"), d.get("object_id"))
+def _is_array(tag, nodes):
+    return tag.endswith(ARRAY_TAG_HINTS) or any("index" in n.get("attrs",{}) for n in nodes)
+def _prov(d, op, tag=None, index=None):
+    x={"operation":op,"file":d.get("file"),"mod":d.get("mod"),"order":d.get("order")}
+    if tag is not None:x["field"]=tag
+    if index is not None:x["index"]=str(index)
+    return x
+
+def _application_key(tag, same_tag_ordinal):
+    try:
+        ordinal=int(same_tag_ordinal)
+    except (TypeError,ValueError):
+        ordinal=0
+    return (str(tag),ordinal)
+
+
+def _slot_json_value(value):
+    if value is None:
+        return None
+    try:
+        s=str(value)
+        return int(s) if s.lstrip('-').isdigit() else s
+    except Exception:
+        return value
+
+
+def _nested_facts(definition, definition_operation, applications):
+    """Retain nested facts; add effective ancestor identity for veterancy only."""
+    app_by_local={
+        _application_key(a.get("tag"),a.get("same_tag_ordinal")):a
+        for a in applications
+    }
+    out=[]
+    for node in definition.get("descendants",[]) or []:
+        depth=int(node.get("depth") or 0)
+        if depth <= 1:
+            continue
+        attrs=deepcopy(node.get("attrs",{}) or {})
+        if not attrs:
+            continue
+        path=list(node.get("path") or [node.get("tag")])
+        item={
+            "tag":node.get("tag"),
+            "path":path,
+            "depth":depth,
+            "attrs":attrs,
+            "provenance":{
+                **_prov(definition,"NESTED_FACT",node.get("tag"),attrs.get("index")),
+                "definition_operation":definition_operation,
+            },
+        }
+        if path and path[0]=="VeterancyLevelArray":
+            raw_context=deepcopy(node.get("ancestor_context",[]) or [])
+            top=raw_context[0] if raw_context else None
+            app=None
+            if top:
+                app=app_by_local.get(_application_key(top.get("tag"),top.get("same_tag_ordinal")))
+            if app is not None and app.get("removed"):
+                continue
+            level_index=app.get("effective_index") if app is not None else None
+            item["ancestor_context"]=raw_context
+            item["effective_ancestor_context"]=[{
+                "tag":app.get("tag"),
+                "effective_index":_slot_json_value(level_index),
+                "slot_source":app.get("slot_source"),
+                "field_operation":app.get("operation"),
+            }] if app is not None else []
+            item["ancestor_context_status"]="RESOLVED" if app is not None else "UNRESOLVED_LOCAL_ANCESTOR"
+            item["veterancy_level_context"]={
+                "status":"RESOLVED" if level_index is not None else "UNRESOLVED",
+                "level_index":_slot_json_value(level_index),
+                "slot_source":app.get("slot_source") if app else None,
+                "field_operation":app.get("operation") if app else None,
+            }
+        out.append(item)
+    return out
+
+
+def _purge_replaced_nested(nested, applications):
+    """Mirror top-level effective child replacement/removal in nested facts."""
+    if not nested:
+        return nested
+    targets=[]
+    for a in applications:
+        if str(a.get("tag")) != "VeterancyLevelArray":
+            continue
+        targets.append((str(a.get("tag")),a.get("effective_index"),bool(a.get("array"))))
+    kept=[]
+    for nf in nested:
+        path=nf.get("path") or []
+        if not path:
+            kept.append(nf); continue
+        root=str(path[0])
+        drop=False
+        for tag,index,is_array in targets:
+            if root != tag:
+                continue
+            if not is_array:
+                drop=True; break
+            ctx=(nf.get("effective_ancestor_context") or [])
+            prior=ctx[0].get("effective_index") if ctx else None
+            if prior is not None and str(prior)==str(index):
+                drop=True; break
+        if not drop:
+            kept.append(nf)
+    return kept
+
+
+def _apply_children(state, definition):
+    # state: tag -> ordered list of {tag,attrs,provenance}
+    # Return an application map so nested descendants can be attached to the
+    # exact effective array instance produced by this definition.
+    grouped=defaultdict(list)
+    for local_fallback,c in enumerate(definition.get("children",[])):
+        x=deepcopy(c)
+        x.setdefault("same_tag_ordinal",local_fallback)
+        grouped[x["tag"]].append(x)
+    applications=[]
+    for tag, patches in grouped.items():
+        cur=state.setdefault(tag,[])
+        array=_is_array(tag, cur+patches)
+        if not array:
+            # Repeated unindexed same-tag children are an array in practice.
+            array=len(patches)>1 or len(cur)>1
+        if not array:
+            p=patches[-1]; attrs=deepcopy(p.get("attrs",{})); removed=attrs.get("removed")=="1"
+            if removed:
+                state[tag]=[]; op="REMOVE"
+            else:
+                op="SET"; state[tag]=[{"tag":tag,"attrs":attrs,"provenance":_prov(definition,op,tag)}]
+            applications.append({
+                "tag":tag,"same_tag_ordinal":p.get("same_tag_ordinal",0),"array":False,
+                "effective_index":None,"slot_source":"SCALAR","operation":op,"removed":removed,
+            })
+            continue
+        for p in patches:
+            attrs=deepcopy(p.get("attrs",{})); idx=attrs.get("index")
+            local_ord=p.get("same_tag_ordinal",0)
+            if idx is None:
+                effective_index=len(cur); removed=attrs.get("removed")=="1"
+                if not removed:
+                    cur.append({"tag":tag,"attrs":attrs,"provenance":_prov(definition,"APPEND",tag,effective_index)})
+                applications.append({
+                    "tag":tag,"same_tag_ordinal":local_ord,"array":True,
+                    "effective_index":effective_index,"slot_source":"IMPLICIT_ORDINAL",
+                    "operation":"REMOVE" if removed else "APPEND","removed":removed,
+                })
+                continue
+            try: i=int(idx)
+            except ValueError:
+                # Named indexes are stable keys; replace matching named index or append.
+                found=next((j for j,n in enumerate(cur) if n.get("attrs",{}).get("index")==idx),None)
+                removed=attrs.get("removed")=="1"
+                if removed:
+                    if found is not None: cur.pop(found)
+                    op="REMOVE"
+                elif found is None:
+                    cur.append({"tag":tag,"attrs":attrs,"provenance":_prov(definition,"PATCH",tag,idx)}); op="PATCH"
+                else:
+                    cur[found]={"tag":tag,"attrs":attrs,"provenance":_prov(definition,"PATCH",tag,idx)}; op="PATCH"
+                applications.append({
+                    "tag":tag,"same_tag_ordinal":local_ord,"array":True,
+                    "effective_index":idx,"slot_source":"NAMED_INDEX","operation":op,"removed":removed,
+                })
+                continue
+            removed=attrs.get("removed")=="1"
+            if removed:
+                if 0 <= i < len(cur):
+                    cur[i]={"tag":tag,"attrs":{"__hole__":"1","index":str(i)},"provenance":_prov(definition,"REMOVE",tag,i)}
+                else:
+                    while len(cur)<i:
+                        cur.append({"tag":tag,"attrs":{"__hole__":"1","index":str(len(cur))},"provenance":_prov(definition,"IMPLICIT_HOLE",tag,len(cur))})
+                    cur.append({"tag":tag,"attrs":{"__hole__":"1","index":str(i)},"provenance":_prov(definition,"REMOVE",tag,i)})
+                op="REMOVE"
+            else:
+                op="PATCH" if i<len(cur) else "APPEND_AT_INDEX"
+                node={"tag":tag,"attrs":attrs,"provenance":_prov(definition,op,tag,i)}
+                if i < len(cur): cur[i]=node
+                else:
+                    while len(cur)<i: cur.append({"tag":tag,"attrs":{"__hole__":"1"},"provenance":_prov(definition,"IMPLICIT_HOLE",tag,len(cur))})
+                    cur.append(node)
+            applications.append({
+                "tag":tag,"same_tag_ordinal":local_ord,"array":True,
+                "effective_index":i,"slot_source":"EXPLICIT_INDEX","operation":op,"removed":removed,
+            })
+    return state, applications
+
+class EffectiveCatalogCompiler:
+    def __init__(self, raw):
+        self.raw=raw; self.by_key=defaultdict(list); self.keys_by_id=defaultdict(list); self.cache={}; self.resolving=set(); self.unresolved=[]
+        for oid,defs in raw.get("objects",{}).items():
+            for d in defs:self.by_key[(d.get("xml_type"),oid)].append(d)
+        for k in self.by_key:
+            self.by_key[k].sort(key=lambda d:d.get("order",0))
+            self.keys_by_id[k[1]].append(k)
+
+    def parent_key(self, child_type, parent_id):
+        """Resolve explicit catalog inheritance without crossing unrelated catalogs.
+
+        HOTS uses abstract/base catalog classes as parents of concrete subclasses,
+        e.g. CAccumulatorToken(parent=BaseAccumulator) where BaseAccumulator is
+        CAccumulator. Exact type wins; otherwise accept the unique longest base
+        type that is a strict prefix of the child type.
+        """
+        exact=(child_type,parent_id)
+        if exact in self.by_key:
+            return exact
+        candidates=[k for k in self.keys_by_id.get(parent_id,[])
+                    if k[0] and child_type and child_type.startswith(k[0])]
+        if not candidates:
+            return None
+        max_len=max(len(k[0]) for k in candidates)
+        best=[k for k in candidates if len(k[0])==max_len]
+        return best[0] if len(best)==1 else None
+    def resolve(self,key):
+        if key in self.cache:return deepcopy(self.cache[key])
+        if key in self.resolving:
+            self.unresolved.append({"code":"INHERITANCE_CYCLE","type":key[0],"id":key[1]}); return None
+        defs=self.by_key.get(key,[])
+        if not defs:return None
+        self.resolving.add(key)
+        state={}; chain=[]; attrs={}; nested=[]; parent_id=None
+        # Parent is catalog inheritance, resolved before local layered definitions.
+        for d in defs:
+            p=d.get("attrs",{}).get("parent")
+            if p: parent_id=p; break
+        if parent_id:
+            pkey=self.parent_key(key[0],parent_id)
+            parent=self.resolve(pkey) if pkey else None
+            if parent:
+                state=deepcopy(parent["fields"]); attrs=deepcopy(parent.get("effective_attrs",{})); nested=deepcopy(parent.get("nested_facts",[])); chain+=parent.get("inheritance_chain",[])+[{"type":pkey[0],"id":parent_id}]
+            else:self.unresolved.append({"code":"UNRESOLVED_PARENT","type":key[0],"id":key[1],"parent":parent_id})
+        contributions=[]
+        for n,d in enumerate(defs):
+            defop="DEFINE" if n==0 else "CONTRIBUTE"
+            attrs.update({k:v for k,v in d.get("attrs",{}).items() if k not in ("id","parent")})
+            _, applications=_apply_children(state,d)
+            nested=_purge_replaced_nested(nested,applications)
+            nested.extend(_nested_facts(d,defop,applications))
+            contributions.append(_prov(d,defop))
+        rec={"object_id":key[1],"xml_type":key[0],"parent":parent_id,"effective_attrs":attrs,"fields":state,
+             "nested_facts":nested,"inheritance_chain":chain,"definitions":contributions}
+        self.resolving.remove(key); self.cache[key]=deepcopy(rec); return rec
+    def compile(self):
+        records={}
+        for key in sorted(self.by_key):
+            r=self.resolve(key); records[f"{key[0]}::{key[1]}"]=r
+        counts=Counter(x["code"] for x in self.unresolved)
+        return {"metadata":{"builder":"effective_catalog_v1_2_effective_ancestor_context","raw_definitions":sum(len(v) for v in self.by_key.values()),"effective_records":len(records),"fail_closed":True},
+                "records":records,"unresolved":self.unresolved,"unresolved_counts":dict(counts)}
+
+def build_effective_catalog(raw_index_path:Path,out_path:Path,report_path:Path):
+    raw=load(raw_index_path); result=EffectiveCatalogCompiler(raw).compile(); save(out_path,result)
+    layered=sum(1 for r in result["records"].values() if len(r["definitions"])>1)
+    inherited=sum(1 for r in result["records"].values() if r.get("parent"))
+    report={"summary":{"effective_records":len(result["records"]),"layered_records":layered,"inherited_records":inherited,"unresolved":len(result["unresolved"])},"unresolved_counts":result["unresolved_counts"],"unresolved_list_count":len(result["unresolved"]), "unresolved_truncated":False, "unresolved":result["unresolved"]}
+    save(report_path,report); return report
