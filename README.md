@@ -22,7 +22,7 @@ parses usefull data from Heroes of the Storm for analyzing games from .StormRepl
 ### Setup
 
 1. Install Python and Git.
-2. Install Python dependencies from `requirements.txt`, if provided.
+2. Install Python dependencies from `requirements.txt`.
 3. Install the .NET runtime or SDK required by the selected HeroesDecode release.
 4. Obtain the required GameData version and S2MA map resources. [READ ME HOW](./parsers_db/README.md)
 5. Configure source-data and output paths.
